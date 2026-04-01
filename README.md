@@ -1,1 +1,1 @@
-[Google Colab demo](https://colab.research.google.com/drive/1gw08dCSDOueVoz3M0jdUnKev8JIve_xY?usp=sharing) (Note: use a GPU instance, I used the A100 instance)
+LLaVa notebook: [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/NaomiEX/DynamicVisualTokenPruning/blob/main/LLaVa.ipynb)
