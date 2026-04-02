@@ -11,26 +11,35 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
     # IMPORTANT ASSUMPTIONS:
     # batch size 1, single image
 
+    def __init__(self, config):
+        super().__init__(config)
+        # Initialize the pruner separately to bypass the base model's 4-bit quantization,
+        # and keep the pruner in float16 to ensure high-precision gradients.
+        self.pruner = None 
+
     def prune_image_features(
         self,
         image_features,
+        inputs_embeds,
         keep_ratio=0.5
     ):
         # assumptions: image features are [1, N, D]
         # returns:
         #   - pruned_features: [1, K, D]
         #   - keep_idx: [K]
-        B, N, D = image_features.shape
-        assert B == 1, "This starter patch only supports batch size 1"
+        # B, N, D = image_features.shape
+        # assert B == 1, "This starter patch only supports batch size 1"
 
-        # calculates n features to keep
-        keep_n = max(1, int(N*keep_ratio)) 
+        # # calculates n features to keep
+        # keep_n = max(1, int(N*keep_ratio)) 
 
-        # keep first n tokens
-        keep_idx = torch.arange(keep_n, device=image_features.device)
+        # # keep first n tokens
+        # keep_idx = torch.arange(keep_n, device=image_features.device)
 
-        pruned = image_features[:, keep_idx, :] # [1, K, D]
+        # pruned = image_features[:, keep_idx, :] # [1, K, D]
 
+        # Use cross attention and MLP to compute importance scores
+        pruned, keep_idx = self.pruner(image_features, inputs_embeds, keep_ratio=keep_ratio)
         return pruned, keep_idx
 
     def _merge_pruned_image_features_single_example(
@@ -197,7 +206,7 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         # 3) ========= PRUNE IMAGE FEATURES HERE ===========
 
         pruned_image_features, keep_idx = self.prune_image_features(
-            image_features, keep_ratio=0.5
+            image_features, inputs_embeds, keep_ratio=0.5
         )
 
         # 4) rebuild sequence
