@@ -1,6 +1,49 @@
 import torch
 import torch.nn as nn
 
+
+class CLIPAttentionPruner(nn.Module):
+    # Baseline: scores tokens by how much CLIP's CLS token attends to each patch
+    # in the last vision encoder layer. _clip_attentions must be set before each forward call (done by PrunableLlava).
+    # Same interface as QueryAwarePruner: forward(x_v, x_t, keep_ratio) -> (pruned, idx)
+    
+
+    def __init__(self):
+        super().__init__()
+        self.last_importance_scores = None
+        self._clip_attentions = None  # set externally before forward
+
+    def forward(self, x_v, x_t, keep_ratio=0.5):
+        # x_v: [B, N, D] projected patch tokens (CLS already excluded)
+        # x_t: unused, here for interface compat
+        assert self._clip_attentions is not None, "_clip_attentions not set"
+
+        # last layer CLS->patch attention, averaged over heads
+        last_attn = self._clip_attentions[-1]        # [B, H, S, S] where S = N+1
+        cls_attn = last_attn[:, :, 0, 1:]            # [B, H, N]
+        importance = cls_attn.float().mean(dim=1)     # [B, N]
+
+        # normalize to [0, 1]
+        lo = importance.min(dim=-1, keepdim=True).values
+        hi = importance.max(dim=-1, keepdim=True).values
+        importance = (importance - lo) / (hi - lo + 1e-8)
+
+        self.last_importance_scores = importance
+
+        if self.training:
+            return x_v * importance.unsqueeze(-1), None
+
+        # hard top-k selection
+        keep_k = max(1, int(x_v.shape[1] * keep_ratio))
+        _, keep_idx = torch.topk(importance, keep_k, dim=1)
+        keep_idx, _ = torch.sort(keep_idx, dim=1)
+
+        gather_idx = keep_idx.unsqueeze(-1).expand(-1, -1, x_v.shape[-1])
+        pruned_v = torch.gather(x_v, 1, gather_idx)
+
+        return pruned_v, keep_idx
+
+
 class QueryAwarePruner(nn.Module):
     def __init__(self, dim, num_heads=8, use_multi_head=True):
         super().__init__()

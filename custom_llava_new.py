@@ -4,18 +4,57 @@ from transformers import (
 )
 
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
+from pruner import CLIPAttentionPruner
 
 
 class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
-    # starter prototype
-    # IMPORTANT ASSUMPTIONS:
     # batch size 1, single image
 
     def __init__(self, config):
         super().__init__(config)
         # Initialize the pruner separately to bypass the base model's 4-bit quantization,
         # and keep the pruner in float16 to ensure high-precision gradients.
-        self.pruner = None 
+        self.pruner = None
+        self.last_pruning_stats = None
+        self._tokens_pruned = 0
+
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs, **kwargs):
+        # generate() tracks attention_mask and position_ids based on the original
+        # (unpruned) input length, but our KV cache is shorter after pruning.
+        # Fix both once right after the prefill so decode steps stay in sync.
+        model_kwargs = super()._update_model_kwargs_for_generation(outputs, model_kwargs, **kwargs)
+
+        n = self._tokens_pruned
+        if n > 0:
+            if (attn := model_kwargs.get("attention_mask")) is not None:
+                model_kwargs["attention_mask"] = attn[:, n:]
+            # position_ids would be based on the old length, drop them and let
+            # the model recompute from cache length
+            model_kwargs.pop("position_ids", None)
+            self._tokens_pruned = 0
+
+        return model_kwargs
+
+    def _get_clip_attentions(self, pixel_values):
+        """Run CLIP vision tower with eager attention to get attention maps.
+        Only used for CLIPAttentionPruner. Features come from the normal SDPA path."""
+        vision_tower = self.model.vision_tower
+        vision_config = vision_tower.vision_model.config
+
+        # sdpa doesn't return attention weights, temporarily switch to eager
+        original_attn = getattr(vision_config, '_attn_implementation', None)
+        vision_config._attn_implementation = "eager"
+
+        clip_outputs = vision_tower(
+            pixel_values,
+            output_attentions=True,
+            return_dict=True,
+        )
+
+        if original_attn is not None:
+            vision_config._attn_implementation = original_attn
+
+        return clip_outputs.attentions  # tuple of [B, H, S, S] per layer
 
     def prune_image_features(
         self,
@@ -27,16 +66,6 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         # returns:
         #   - pruned_features: [1, K, D]
         #   - keep_idx: [K]
-        # B, N, D = image_features.shape
-        # assert B == 1, "This starter patch only supports batch size 1"
-
-        # # calculates n features to keep
-        # keep_n = max(1, int(N*keep_ratio)) 
-
-        # # keep first n tokens
-        # keep_idx = torch.arange(keep_n, device=image_features.device)
-
-        # pruned = image_features[:, keep_idx, :] # [1, K, D]
 
         # Use cross attention and MLP to compute importance scores
         pruned, keep_idx = self.pruner(image_features, inputs_embeds, keep_ratio=keep_ratio)
@@ -155,28 +184,32 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        ## for decode steps, the same image tokens are reused so no pruning required, run normal behaviour 
+        ## decode steps: image tokens already in KV cache, just run the LM
         if pixel_values is None:
-            return super().forward(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+            outputs = self.model.language_model(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
-                vision_feature_layer=vision_feature_layer,
-                vision_feature_select_strategy=vision_feature_select_strategy,
-                labels=labels,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                image_sizes=image_sizes,
-                return_dict=return_dict,
-                logits_to_keep=logits_to_keep,
+                return_dict=True,
                 **kwargs,
             )
-        
-        ## first iteration (prefill with new image tokens)
+            hidden_states = outputs[0]
+            logits = self.lm_head(hidden_states)
+            return LlavaCausalLMOutputWithPast(
+                loss=None,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
+        ## prefill: encode image, prune, merge with text, run LM
 
         if (input_ids is None) == (inputs_embeds is None):
             if inputs_embeds is None:
@@ -187,7 +220,12 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         # 1) Text embeddings
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # 2) Get image features (Note this entire section is the same as this part of LlavaModel's forward)
+        # 2) Image features
+        # For CLIPAttentionPruner, do an extra eager pass to get attention maps.
+        # Features always come from the normal SDPA path (numerically consistent).
+        if isinstance(self.pruner, CLIPAttentionPruner):
+            self.pruner._clip_attentions = self._get_clip_attentions(pixel_values)
+
         image_outputs = self.model.get_image_features(
             pixel_values=pixel_values,
             vision_feature_layer=vision_feature_layer,
@@ -206,7 +244,7 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         # 3) ========= PRUNE IMAGE FEATURES HERE ===========
 
         pruned_image_features, keep_idx = self.prune_image_features(
-            image_features, inputs_embeds, keep_ratio=0.5
+            image_features, inputs_embeds, keep_ratio=getattr(self, 'keep_ratio', 0.5)
         )
 
         # 4) rebuild sequence
@@ -217,8 +255,11 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
                 attention_mask=attention_mask,
                 image_features=pruned_image_features,
             )
-        
-        # 5) Call the language model directly with the rebuilt embeddings
+
+        self.last_pruning_stats = {"original_n": old_n, "pruned_n": new_n}
+        self._tokens_pruned = old_n - new_n
+
+        # 5) Run language model on the rebuilt (shorter) sequence
         outputs = self.model.language_model(
             attention_mask=new_attention_mask,
             position_ids=new_position_ids,

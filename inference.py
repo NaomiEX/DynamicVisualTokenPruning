@@ -10,7 +10,7 @@ from PIL import Image
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 from custom_llava_new import PrunableLlavaForConditionalGeneration
-from pruner import QueryAwarePruner
+from pruner import CLIPAttentionPruner, QueryAwarePruner
 
 
 def parse_args():
@@ -19,6 +19,8 @@ def parse_args():
     parser.add_argument("--output", type=str, default="inference_results.json")
     parser.add_argument("--model-id", type=str, default="llava-hf/llava-1.5-7b-hf")
     parser.add_argument("--pruner-checkpoint", type=str, default="", help="Path to best_pruner.pt. Run without pruning if no path")
+    parser.add_argument("--pruner-type", type=str, default="learned", choices=["learned", "clip-attention"],
+                        help="'learned' = QueryAwarePruner, 'clip-attention' = CLIP self-attention baseline")
     parser.add_argument("--keep-ratio", type=float, default=0.5, help="Fraction of image tokens to keep.")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     return parser.parse_args()
@@ -51,7 +53,19 @@ def load_model(args, device):
     processor = AutoProcessor.from_pretrained(args.model_id)
     model_kwargs = dict(low_cpu_mem_usage=True, torch_dtype=torch.float16)
 
-    if args.pruner_checkpoint:
+    if args.pruner_type == "clip-attention":
+        model = PrunableLlavaForConditionalGeneration.from_pretrained(
+            args.model_id, **model_kwargs,
+        ).to(device)
+        model.eval()
+        model.keep_ratio = args.keep_ratio
+
+        pruner = CLIPAttentionPruner()
+        pruner.eval()
+        model.pruner = pruner
+        print("CLIP attention baseline (last-layer CLS attention)")
+
+    elif args.pruner_checkpoint:
         model = PrunableLlavaForConditionalGeneration.from_pretrained(
             args.model_id, **model_kwargs,
         ).to(device)
@@ -64,7 +78,8 @@ def load_model(args, device):
         pruner.load_state_dict(checkpoint["state_dict"])
         pruner.eval()
         model.pruner = pruner
-        print("Run model with pruner")
+        print("Run model with learned pruner")
+
     else:
         model = LlavaForConditionalGeneration.from_pretrained(
             args.model_id, **model_kwargs,
@@ -105,7 +120,7 @@ def main():
     samples = load_samples(args.input)
 
     processor, model = load_model(args, device)
-    has_pruner = bool(args.pruner_checkpoint)
+    has_pruner = bool(args.pruner_checkpoint) or args.pruner_type == "clip-attention"
     results = []
 
     for idx, sample in enumerate(samples):
