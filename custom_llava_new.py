@@ -4,7 +4,7 @@ from transformers import (
 )
 
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
-from pruner import CLIPAttentionPruner
+from pruner import CLIPAttentionPruner, LLMAttentionPruner
 
 
 class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
@@ -55,6 +55,54 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
             vision_config._attn_implementation = original_attn
 
         return clip_outputs.attentions  # tuple of [B, H, S, S] per layer
+
+    def _get_llm_attentions(self, inputs_embeds, attention_mask, num_layers):
+        """Run the first K layers of the LLM on the full merged sequence to get
+        attention maps. Same sdpa->eager trick as the CLIP path."""
+        llm = self.model.language_model  # LlamaModel
+        llm_config = llm.config
+
+        original_attn = getattr(llm_config, '_attn_implementation', None)
+        llm_config._attn_implementation = "eager"
+
+        seq_len = inputs_embeds.shape[1]
+        device = inputs_embeds.device
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        from transformers.masking_utils import create_causal_mask
+        causal_mask = create_causal_mask(
+            config=llm_config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+        position_embeddings = llm.rotary_emb(inputs_embeds, position_ids=position_ids)
+
+        hidden = inputs_embeds
+        attentions = []
+        for layer in llm.layers[:num_layers]:
+            # LlamaDecoderLayer with eager attention returns (hidden, attn_weights)
+            # but the GradientCheckpointingLayer wrapper flattens it, so we need
+            # to call self_attn directly to get weights
+            residual = hidden
+            normed = layer.input_layernorm(hidden)
+            attn_out, attn_weights = layer.self_attn(
+                hidden_states=normed,
+                attention_mask=causal_mask,
+                position_embeddings=position_embeddings,
+                output_attentions=True,
+            )
+            hidden = residual + attn_out
+            # skip MLP -- we only need the attention weights
+            residual = hidden
+            hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+            attentions.append(attn_weights)
+
+        if original_attn is not None:
+            llm_config._attn_implementation = original_attn
+
+        return attentions  # list of [B, H, seq, seq]
 
     def prune_image_features(
         self,
@@ -220,12 +268,7 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         # 1) Text embeddings
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # 2) Image features
-        # For CLIPAttentionPruner, do an extra eager pass to get attention maps.
-        # Features always come from the normal SDPA path (numerically consistent).
-        if isinstance(self.pruner, CLIPAttentionPruner):
-            self.pruner._clip_attentions = self._get_clip_attentions(pixel_values)
-
+        # 2) Image features (always via normal SDPA path)
         image_outputs = self.model.get_image_features(
             pixel_values=pixel_values,
             vision_feature_layer=vision_feature_layer,
@@ -242,7 +285,31 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
             image_features = image_features.unsqueeze(0)
         
         # 3) ========= PRUNE IMAGE FEATURES HERE ===========
+        if isinstance(self.pruner, CLIPAttentionPruner):
+            self.pruner._clip_attentions = self._get_clip_attentions(pixel_values)
 
+        elif isinstance(self.pruner, LLMAttentionPruner):
+            # build full merged sequence so we can run first K LLM layers on it
+            image_token_id = self.config.image_token_id
+            image_mask = (input_ids[0] == image_token_id)
+            image_positions = torch.where(image_mask)[0]
+            start = image_positions[0].item()
+            end = image_positions[-1].item() + 1
+            # splice image features into text embeddings
+            full_embeds = torch.cat([
+                inputs_embeds[0, :start],
+                image_features[0],
+                inputs_embeds[0, end:],
+            ], dim=0).unsqueeze(0)
+            full_attn = torch.ones(1, full_embeds.shape[1], device=full_embeds.device, dtype=attention_mask.dtype)
+            llm_attentions = self._get_llm_attentions(full_embeds, full_attn, self.pruner.num_layers)
+            self.pruner._llm_attentions = llm_attentions
+            # image_mask for the merged sequence (not the original input_ids)
+            merged_image_mask = torch.zeros(full_embeds.shape[1], dtype=torch.bool, device=full_embeds.device)
+            merged_image_mask[start:start + image_features.shape[1]] = True
+            self.pruner._image_mask = merged_image_mask
+
+        # 4) Prune
         pruned_image_features, keep_idx = self.prune_image_features(
             image_features, inputs_embeds, keep_ratio=getattr(self, 'keep_ratio', 0.5)
         )

@@ -44,6 +44,62 @@ class CLIPAttentionPruner(nn.Module):
         return pruned_v, keep_idx
 
 
+class LLMAttentionPruner(nn.Module):
+    # Baseline: run first K layers of the LLM on the full (unpruned) merged sequence,
+    # then score image tokens by how much text tokens attend to them.
+    # Query-aware (unlike CLIPAttentionPruner) but costs a partial LLM forward pass.
+    #
+    # _llm_attentions and _image_mask must be set before forward (done by PrunableLlava).
+    # Same interface as QueryAwarePruner.
+
+    def __init__(self, num_layers=1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.last_importance_scores = None
+        self._llm_attentions = None  # list of [B, H, seq, seq] from first K layers
+        self._image_mask = None      # [seq] bool mask, True for image token positions
+
+    def forward(self, x_v, x_t, keep_ratio=0.5):
+        # x_v: [B, N, D] image features (not used for scoring, just for pruning)
+        # x_t: unused
+        assert self._llm_attentions is not None, "_llm_attentions not set"
+        assert self._image_mask is not None, "_image_mask not set"
+
+        image_mask = self._image_mask  # [seq]
+        image_positions = torch.where(image_mask)[0]  # indices of image tokens
+        text_positions = torch.where(~image_mask)[0]   # indices of text tokens
+
+        # average attention across layers and heads
+        # each is [B, H, seq, seq] -> stack -> [B, K, H, seq, seq] -> mean over K,H
+        attn_stack = torch.stack(self._llm_attentions, dim=1)  # [B, K, H, seq, seq]
+        attn_avg = attn_stack.float().mean(dim=(1, 2))         # [B, seq, seq]
+
+        # how much text tokens attend to each image token
+        # attn_avg[:, text_positions, :][:, :, image_positions] -> [B, n_text, N]
+        text_to_image = attn_avg[:, text_positions][:, :, image_positions]  # [B, n_text, N]
+        importance = text_to_image.mean(dim=1)  # [B, N] avg over text positions
+
+        # normalize to [0, 1]
+        lo = importance.min(dim=-1, keepdim=True).values
+        hi = importance.max(dim=-1, keepdim=True).values
+        importance = (importance - lo) / (hi - lo + 1e-8)
+
+        self.last_importance_scores = importance
+
+        if self.training:
+            return x_v * importance.unsqueeze(-1), None
+
+        # hard top-k
+        keep_k = max(1, int(x_v.shape[1] * keep_ratio))
+        _, keep_idx = torch.topk(importance, keep_k, dim=1)
+        keep_idx, _ = torch.sort(keep_idx, dim=1)
+
+        gather_idx = keep_idx.unsqueeze(-1).expand(-1, -1, x_v.shape[-1])
+        pruned_v = torch.gather(x_v, 1, gather_idx)
+
+        return pruned_v, keep_idx
+
+
 class QueryAwarePruner(nn.Module):
     def __init__(self, dim, num_heads=8, use_multi_head=True):
         super().__init__()
