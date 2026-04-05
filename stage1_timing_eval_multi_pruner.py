@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of layers to use for LLM-attention baseline pruner",
     )
 
+    parser.add_argument("--streaming", action="store_true", help="Stream HF dataset instead of downloading fully")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
@@ -82,14 +83,20 @@ def load_samples_from_file(path: str) -> List[Dict[str, Any]]:
     return samples
 
 
-def load_samples_from_hf(dataset_name: str, split: str, num_samples: int, seed: int) -> List[Dict[str, Any]]:
+def load_samples_from_hf(dataset_name: str, split: str, num_samples: int, seed: int, streaming: bool = False) -> List[Dict[str, Any]]:
     from datasets import load_dataset
 
-    ds = load_dataset(dataset_name, split=split)
     if num_samples <= 0:
         raise ValueError("--num-samples must be > 0")
-    take_n = min(num_samples, len(ds))
-    ds = ds.shuffle(seed=seed).select(range(take_n))
+
+    ds = load_dataset(dataset_name, split=split, streaming=streaming)
+    ds = ds.shuffle(seed=seed)
+
+    if streaming:
+        ds = ds.take(num_samples)
+    else:
+        take_n = min(num_samples, len(ds))
+        ds = ds.select(range(take_n))
 
     samples: List[Dict[str, Any]] = []
     for ex in ds:
@@ -114,7 +121,7 @@ def load_samples(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if args.input:
         return load_samples_from_file(args.input)
     if args.hf_dataset:
-        return load_samples_from_hf(args.hf_dataset, args.hf_split, args.num_samples, args.seed)
+        return load_samples_from_hf(args.hf_dataset, args.hf_split, args.num_samples, args.seed, streaming=args.streaming)
     raise ValueError("Provide either --input or --hf-dataset")
 
 
