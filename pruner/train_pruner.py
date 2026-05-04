@@ -12,7 +12,7 @@ from tqdm import tqdm
 from transformers import AutoProcessor, BitsAndBytesConfig
 
 from custom_llava_new import PrunableLlavaForConditionalGeneration
-from pruner import QueryAwarePruner
+from pruner.pruner import QueryAwarePruner
 
 
 def parse_args():
@@ -60,6 +60,7 @@ def parse_args():
     )
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint in --output-dir")
     return parser.parse_args()
 
 
@@ -574,7 +575,7 @@ def run_epoch(dataset, model, pruner, optimizer, device, soft_target_weight, tra
     }
 
 
-def save_checkpoint(output_dir, epoch, pruner, args, best_val_overlap):
+def save_checkpoint(output_dir, epoch, pruner, optimizer, args, best_val_overlap, history, train_records, val_records):
     checkpoint = {
         "epoch": epoch,
         "best_val_topk_overlap": best_val_overlap,
@@ -587,9 +588,38 @@ def save_checkpoint(output_dir, epoch, pruner, args, best_val_overlap):
             "use_multi_head": pruner.use_multi_head,
         },
         "state_dict": pruner.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "history": history,
+        "train_indices": [r["question_id"] for r in train_records],
+        "val_indices": [r["question_id"] for r in val_records],
     }
     torch.save(checkpoint, Path(output_dir) / "best_pruner.pt")
 
+def load_checkpoint(output_dir, pruner, optimizer, device):
+    for filename in ["last_pruner.pt", "best_pruner.pt"]:
+        path = Path(output_dir) / filename
+        if path.exists():
+            checkpoint = torch.load(path, map_location=device)
+            pruner.load_state_dict(checkpoint["state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint["epoch"] + 1
+            best_val_overlap = checkpoint["best_val_topk_overlap"]
+            history = checkpoint.get("history", [])
+            train_indices = checkpoint.get("train_indices")
+            val_indices = checkpoint.get("val_indices")
+            print(f"Resuming from {filename}, epoch {start_epoch}, best val overlap: {best_val_overlap:.4f}")
+            return start_epoch, best_val_overlap, history, train_indices, val_indices
+
+    return 1, float("-inf"), [], None, None
+
+def read_checkpoint(output_dir, device):
+    """Just reads the checkpoint file, no side effects."""
+    for filename in ["last_pruner.pt", "best_pruner.pt"]:
+        path = Path(output_dir) / filename
+        if path.exists():
+            print(f"Found checkpoint: {filename}")
+            return torch.load(path, map_location=device)
+    return None
 
 def main():
     args = parse_args()
@@ -601,17 +631,36 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    records = load_sample_records(args.samples_dir, args.manifest)
-    train_records, val_records = split_records(
-        records=records,
-        train_ratio=args.train_split,
-        seed=args.seed,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
-    )
+    # Resume or fresh start
+    start_epoch = 1
+    best_val_overlap = float("-inf")
+    history = []
+    train_indices = None
+    val_indices = None
 
+    if args.resume:
+        start_epoch, best_val_overlap, history, train_indices, val_indices = load_checkpoint(
+            args.output_dir, pruner, optimizer, device
+        )
+
+    records = load_sample_records(args.samples_dir, args.manifest)
     print(f"Loaded {len(records)} provenance samples from {args.samples_dir}")
-    print(f"Train samples: {len(train_records)} | Val samples: {len(val_records)}")
+
+    # Reconstruct exact same split if resuming, otherwise create fresh split
+    if train_indices is not None:
+        index_map = {r["question_id"]: r for r in records}
+        train_records = [index_map[i] for i in train_indices if i in index_map]
+        val_records = [index_map[i] for i in val_indices if i in index_map]
+        print(f"Restored split: {len(train_records)} train | {len(val_records)} val")
+    else:
+        train_records, val_records = split_records(
+            records=records,
+            train_ratio=args.train_split,
+            seed=args.seed,
+            max_train_samples=args.max_train_samples,
+            max_val_samples=args.max_val_samples,
+        )
+        print(f"Train samples: {len(train_records)} | Val samples: {len(val_records)}")
 
     processor = AutoProcessor.from_pretrained(args.model_id)
     model = PrunableLlavaForConditionalGeneration.from_pretrained(
@@ -661,8 +710,8 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    history = []
-    best_val_overlap = float("-inf")
+    # history = []
+    # best_val_overlap = float("-inf")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
@@ -699,7 +748,18 @@ def main():
 
         if val_metrics["topk_overlap"] > best_val_overlap:
             best_val_overlap = val_metrics["topk_overlap"]
-            save_checkpoint(output_dir, epoch, pruner, args, best_val_overlap)
+            save_checkpoint(output_dir, epoch, pruner, optimizer, args, best_val_overlap, history, train_records, val_records)
+
+        # Save last checkpoint every epoch
+        torch.save({
+            "epoch": epoch,
+            "best_val_topk_overlap": best_val_overlap,
+            "state_dict": pruner.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
+            "train_indices": [r["question_id"] for r in train_records],
+            "val_indices": [r["question_id"] for r in val_records],
+        }, output_dir / "last_pruner.pt")
 
     summary = {
         "model_id": args.model_id,

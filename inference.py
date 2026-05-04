@@ -10,7 +10,7 @@ from PIL import Image
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 from custom_llava_new import PrunableLlavaForConditionalGeneration
-from pruner import CLIPAttentionPruner, LLMAttentionPruner, QueryAwarePruner
+from pruner.pruner import CLIPAttentionPruner, LLMAttentionPruner, QueryAwarePruner
 
 
 def parse_args():

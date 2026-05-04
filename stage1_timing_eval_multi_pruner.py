@@ -13,7 +13,7 @@ from PIL import Image
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 from custom_llava_new import PrunableLlavaForConditionalGeneration
-from pruner import QueryAwarePruner
+from pruner.pruner import QueryAwarePruner
 
 
 def parse_args() -> argparse.Namespace:
