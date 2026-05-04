@@ -1,3 +1,5 @@
+import time
+
 import torch
 from transformers import (
     LlavaForConditionalGeneration,
@@ -5,6 +7,11 @@ from transformers import (
 
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 from pruner import CLIPAttentionPruner, LLMAttentionPruner
+
+
+def _sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
@@ -265,26 +272,32 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
             else:
                 raise ValueError("Starter patch expects input_ids, not only inputs_embeds.")
 
+        device = input_ids.device
+
         # 1) Text embeddings
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
         # 2) Image features (always via normal SDPA path)
-        image_outputs = self.model.get_image_features(
+        _sync(device)
+        _t = time.perf_counter()
+        image_features = self.model.get_image_features(
             pixel_values=pixel_values,
             vision_feature_layer=vision_feature_layer,
             vision_feature_select_strategy=vision_feature_select_strategy,
             image_sizes=image_sizes,
-            return_dict=True
         )
-
-        image_features = image_outputs.pooler_output
-        image_features = torch.cat(image_features, dim=0)\
-                              .to(inputs_embeds.device, inputs_embeds.dtype)
+        if isinstance(image_features, (list, tuple)):
+            image_features = torch.cat(list(image_features), dim=0)
+        image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
         if image_features.ndim == 2:
             image_features = image_features.unsqueeze(0)
-        
+        _sync(device)
+        vision_encoder_ms = (time.perf_counter() - _t) * 1000.0
+
         # 3) ========= PRUNE IMAGE FEATURES HERE ===========
+        _sync(device)
+        _t = time.perf_counter()
         if isinstance(self.pruner, CLIPAttentionPruner):
             self.pruner._clip_attentions = self._get_clip_attentions(pixel_values)
 
@@ -313,8 +326,10 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         pruned_image_features, keep_idx = self.prune_image_features(
             image_features, inputs_embeds, keep_ratio=getattr(self, 'keep_ratio', 0.5)
         )
+        _sync(device)
+        pruner_ms = (time.perf_counter() - _t) * 1000.0
 
-        # 4) rebuild sequence
+        # 5) rebuild sequence
         new_input_ids, new_inputs_embeds, new_attention_mask, new_position_ids, old_n, new_n = \
             self._merge_pruned_image_features_single_example(
                 input_ids=input_ids,
@@ -323,10 +338,18 @@ class PrunableLlavaForConditionalGeneration(LlavaForConditionalGeneration):
                 image_features=pruned_image_features,
             )
 
-        self.last_pruning_stats = {"original_n": old_n, "pruned_n": new_n}
+        self.last_pruning_stats = {
+            "original_n": old_n,
+            "pruned_n": new_n,
+            "vision_encoder_ms": vision_encoder_ms,
+            "pruner_ms": pruner_ms,
+        }
         self._tokens_pruned = old_n - new_n
 
-        # 5) Run language model on the rebuilt (shorter) sequence
+        # 6) Run language model on the rebuilt (shorter) sequence
+        # cache_position from generate() is sized to the unpruned input; drop
+        # it so the LM recomputes one consistent with the pruned sequence.
+        kwargs.pop("cache_position", None)
         outputs = self.model.language_model(
             attention_mask=new_attention_mask,
             position_ids=new_position_ids,
