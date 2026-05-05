@@ -33,3 +33,13 @@ __pycache__/custom_qwen.cpython-310.pyc
 __pycache__/pruner.cpython-310.pyc
 run_timing_llava.sbatch
 run_timing_qwen.sbatch
+CLAUDE.md
+__pycache__/fastv_qwen.cpython-310.pyc
+logs/fastv_smoke-8392292.out
+logs/fastv_smoke-8392292.err
+logs/fastv_token_prune-8387782.err
+logs/fastv_token_prune-8387782.out
+pruner/__pycache__/pruner.cpython-310.pyc
+pruner/__pycache__/__init__.cpython-310.pyc
+run_timing_qwen_smoke.sbatch
+qwen_fastv_smoke.json

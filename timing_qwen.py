@@ -15,6 +15,7 @@ from PIL import Image
 from transformers import AutoProcessor, LogitsProcessor, LogitsProcessorList
 
 from custom_qwen import PrunableQwen2_5_VLForConditionalGeneration
+from fastv_qwen import FastVQwen2_5_VLForConditionalGeneration
 from pruner import QueryAwarePruner
 
 
@@ -30,9 +31,11 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--streaming", action="store_true")
-    p.add_argument("--pruner-type", choices=["none", "random", "learned"], default="none")
+    p.add_argument("--pruner-type", choices=["none", "random", "learned", "fastv"], default="none")
     p.add_argument("--keep-ratio", type=float, default=0.5)
     p.add_argument("--pruner-checkpoint", default="")
+    p.add_argument("--fastv-k", type=int, default=2,
+                   help="FastV pruning layer index (only used when --pruner-type fastv).")
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--dtype", default="bfloat16", choices=list(DTYPE))
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -174,7 +177,7 @@ def attach_pruner(model, args, device, dtype):
     text_cfg = getattr(model.config, "text_config", model.config)
     model_dim = text_cfg.hidden_size
 
-    if args.pruner_type == "none":
+    if args.pruner_type in ("none", "fastv"):
         return
 
     if args.pruner_type == "random":
@@ -209,12 +212,20 @@ def main():
     dtype = DTYPE[args.dtype]
 
     print(f"Loading {args.model_id} (dtype={args.dtype}, attn={args.attn_impl})")
-    model = PrunableQwen2_5_VLForConditionalGeneration.from_pretrained(
+    ModelCls = (
+        FastVQwen2_5_VLForConditionalGeneration
+        if args.pruner_type == "fastv"
+        else PrunableQwen2_5_VLForConditionalGeneration
+    )
+    model = ModelCls.from_pretrained(
         args.model_id,
         torch_dtype=dtype,
         device_map=str(device),
         attn_implementation=args.attn_impl,
     )
+    if args.pruner_type == "fastv":
+        model.fastv_k = args.fastv_k
+        model.fastv_r = 1.0 - args.keep_ratio
     model.eval()
     proc_kwargs = {}
     if args.min_pixels is not None:
@@ -322,6 +333,7 @@ def main():
             "model_id": args.model_id,
             "pruner_type": args.pruner_type,
             "keep_ratio": args.keep_ratio if args.pruner_type != "none" else None,
+            "fastv_k": args.fastv_k if args.pruner_type == "fastv" else None,
             "pruner_checkpoint": args.pruner_checkpoint or None,
             "max_new_tokens": args.max_new_tokens,
             "dtype": args.dtype,
