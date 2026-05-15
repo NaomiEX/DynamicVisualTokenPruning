@@ -81,6 +81,8 @@ class PrunableQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGenerat
         image_token_id = self.config.image_token_id
 
         image_features_list = self.model.get_image_features(pixel_values, image_grid_thw)
+        if hasattr(image_features_list, "pooler_output"):
+            image_features_list = image_features_list.pooler_output
         full_image_embeds = torch.cat(image_features_list, dim=0)  # [N_img, D]
 
         full_text_embeds = self.get_input_embeddings()(input_ids)  # [B, S, D]

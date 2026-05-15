@@ -98,6 +98,8 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
 
         inputs_embeds = self.get_input_embeddings()(input_ids)
         image_embeds = self.model.get_image_features(pixel_values, image_grid_thw)
+        if hasattr(image_embeds, "pooler_output"):
+            image_embeds = image_embeds.pooler_output
         image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask, _ = self.model.get_placeholder_mask(
             input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -106,16 +108,24 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
 
         if pixel_values_videos is not None:
             video_embeds = self.model.get_video_features(pixel_values_videos, video_grid_thw)
+            if hasattr(video_embeds, "pooler_output"):
+                video_embeds = video_embeds.pooler_output
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+        mm_token_type_ids[input_ids == self.config.image_token_id] = 1
+        video_tok = getattr(self.config, "video_token_id", None)
+        if video_tok is not None:
+            mm_token_type_ids[input_ids == video_tok] = 2
         position_ids_full, rope_deltas_full = self.model.get_rope_index(
             input_ids,
-            image_grid_thw,
-            video_grid_thw,
+            mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
             attention_mask=attention_mask,
         )
@@ -146,10 +156,11 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
         K = min(self.fastv_k, len(text_model.layers))
         hidden_states = inputs_embeds
 
-        for layer in text_model.layers[: K - 1]:
+        layer_types = text_model.config.layer_types
+        for i, layer in enumerate(text_model.layers[: K - 1]):
             layer_out = layer(
                 hidden_states,
-                attention_mask=masks_full[layer.attention_type],
+                attention_mask=masks_full[layer_types[i]],
                 position_ids=None,
                 past_key_values=past_key_values,
                 output_attentions=False,
@@ -157,7 +168,7 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
                 cache_position=cache_position_full,
                 position_embeddings=position_embeddings_full,
             )
-            hidden_states = layer_out[0]
+            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         layer_k = text_model.layers[K - 1]
         image_token_id = self.config.image_token_id
@@ -170,7 +181,8 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
         q = attn.q_proj(normed).view(bsz, seq_len, -1, attn.head_dim).transpose(1, 2)
         k = attn.k_proj(normed).view(bsz, seq_len, -1, attn.head_dim).transpose(1, 2)
         cos, sin = position_embeddings_full
-        q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, attn.rope_scaling["mrope_section"])
+        mrope_section = text_config.rope_scaling["mrope_section"]
+        q, k = apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section)
         num_kv_groups = q.shape[1] // k.shape[1]
         if num_kv_groups > 1:
             k = k.repeat_interleave(num_kv_groups, dim=1)
@@ -181,7 +193,7 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
 
         layer_out = layer_k(
             hidden_states,
-            attention_mask=masks_full[layer_k.attention_type],
+            attention_mask=masks_full[layer_types[K - 1]],
             position_ids=None,
             past_key_values=past_key_values,
             output_attentions=False,
@@ -189,7 +201,7 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
             cache_position=cache_position_full,
             position_embeddings=position_embeddings_full,
         )
-        hidden_states = layer_out[0]
+        hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
         keep_n = max(1, int(round(n_img * (1.0 - self.fastv_r))))
         _, top_local = torch.topk(scores, keep_n)
         keep_image_positions = image_positions[top_local]
@@ -207,7 +219,11 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
             cos.index_select(-2, keep_idx),
             sin.index_select(-2, keep_idx),
         )
-        cache_position_pruned = cache_position_full.index_select(0, keep_idx)
+        # After pruning, the post-K layers operate on S_pruned tokens. The
+        # transformers 5.x mask builder reads kv-length from past_key_values,
+        # which was just populated to length S by layers[:K]. Hide it for the
+        # mask construction; the layer.forward calls still use the real cache.
+        cache_position_pruned = torch.arange(len(keep_idx), device=device)
         attn_pruned = (
             attention_mask.index_select(1, keep_idx) if attention_mask is not None else None
         )
@@ -216,17 +232,17 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
             "input_embeds": hidden_states,
             "attention_mask": attn_pruned,
             "cache_position": cache_position_pruned,
-            "past_key_values": past_key_values,
+            "past_key_values": None,
             "position_ids": None,
         }
         masks_pruned = {"full_attention": create_causal_mask(**mask_kwargs_pruned)}
         if text_model.has_sliding_layers:
             masks_pruned["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs_pruned)
 
-        for layer in text_model.layers[K:]:
+        for i, layer in enumerate(text_model.layers[K:], start=K):
             layer_out = layer(
                 hidden_states,
-                attention_mask=masks_pruned[layer.attention_type],
+                attention_mask=masks_pruned[layer_types[i]],
                 position_ids=None,
                 past_key_values=past_key_values,
                 output_attentions=False,
@@ -234,7 +250,7 @@ class FastVQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration
                 cache_position=cache_position_pruned,
                 position_embeddings=position_embeddings_pruned,
             )
-            hidden_states = layer_out[0]
+            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         hidden_states = text_model.norm(hidden_states)
 
