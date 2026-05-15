@@ -46,6 +46,18 @@ bash run_mme_eval.sh
 
 Sweeps `accuracy_mme_realworld_qwen.py` over five configs and writes `mme_{none,fastv_k2_r02,fastv_k2_r04,random_r02,random_r04}.json` in the repo root. ~30 min total on A100.
 
+### Alternative: Jupyter notebooks
+
+If you'd rather step through cells interactively:
+
+```bash
+pip install jupyter
+jupyter lab
+```
+
+- The two lite eval scripts use `# %%` cell markers, so they open directly as notebooks in **VS Code** (Python interactive) or via **jupytext** (`pip install jupytext`, then `jupytext --to ipynb mme_data/evaluate_learned_pruner_mme_lite_exact_match.py`). Same code, same outputs.
+- `mme_data/evaluate_learned_pruner_mme_exact_match.ipynb` and `mme_data/evaluate_pruned_accuracy_mme_exact_match.ipynb` are the original notebooks that produced the full 500-sample **MME-RealWorld** numbers (the main MME table in the report, *not* the lite camera-perception subset). They expect `mme_data/execution_outputs/manifest.json` and local images under `mme_data/images/`, which are not bundled with this repo — use the `.py` scripts above for self-contained lite reproduction.
+
 ---
 
 ## Output schema (both pipelines)
